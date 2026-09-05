@@ -82,14 +82,18 @@ type Provider struct {
 	// interactive session — where hover / definition traffic keeps the
 	// provider's lastUsed fresh and the router never reaps it — does
 	// not retain every navigated file's bytes for the daemon's
-	// lifetime. Accessed lock-free (see getSource, which tolerates a
-	// miss by falling back to col=0): the interactive
-	// open→lookup→close sequence is serialized per file, so it needs
-	// no docMu.
+	// lifetime. Written under docMu: the interactive
+	// open→lookup→close sequence was serialized per file when this
+	// cache was introduced, but on-demand confirmation
+	// (ConfirmSymbolRefs) and the MCP tool path now reach openDocument
+	// from concurrent request goroutines, and an unsynchronised map
+	// write there is a fatal (uncatchable) concurrent map writes
+	// crash, so every access shares the docMu the open/close
+	// bookkeeping already holds.
 	sourceCache map[string][]byte
 
-	// docMu guards docVersions / openDocs / lastDiag so concurrent
-	// callers (LSP push notifications + MCP request goroutines) can
+	// docMu guards docVersions / openDocs / lastDiag / sourceCache so
+	// concurrent callers (LSP push notifications + MCP request goroutines) can
 	// share one client safely.
 	docMu       sync.RWMutex
 	docVersions map[string]int          // absPath → most-recent didOpen / didChange version
@@ -2026,13 +2030,13 @@ func (p *Provider) resetForReconnect() {
 	p.docVersions = map[string]int{}
 	p.openDocs = map[string]bool{}
 	p.lastDiag = map[string][]Diagnostic{}
-	p.docMu.Unlock()
-	// sourceCache is the unsynchronised interactive-navigation cache
-	// (written lock-free by openDocument); drop it on reconnect so a
-	// long-lived provider doesn't carry the dead session's file bytes.
-	// nil is the freed state — openDocument lazily re-creates it and
-	// getSource nil-checks before reading.
+	// sourceCache rides the same reset under docMu (every access is
+	// docMu-guarded); drop it on reconnect so a long-lived provider
+	// doesn't carry the dead session's file bytes. nil is the freed
+	// state — openDocument lazily re-creates it and getSource
+	// nil-checks under the same lock before reading.
 	p.sourceCache = nil
+	p.docMu.Unlock()
 }
 
 // dialOrSpawn builds the LSP client according to the provider's spec.
@@ -2769,7 +2773,12 @@ func uriToAbsPath(uri string) string {
 // openDocument sends textDocument/didOpen for a file. Tracks version
 // 1 in docVersions so a later didChange can monotonically bump it.
 // Idempotent — a second call to openDocument with the same path is a
-// no-op.
+// no-op. Concurrent calls on the same path are funnelled into one
+// didOpen: the first claimant marks the path open before its disk
+// read, so every later caller (including one that raced the initial
+// check-then-act) sees the open in progress and returns immediately.
+// The claim is released if the read or the didOpen fails, so a retry
+// starts clean.
 func (p *Provider) openDocument(repoRoot, relPath string) error {
 	absPath := filepath.Join(repoRoot, relPath)
 	p.docMu.Lock()
@@ -2777,16 +2786,20 @@ func (p *Provider) openDocument(repoRoot, relPath string) error {
 		p.docMu.Unlock()
 		return nil
 	}
+	p.openDocs[absPath] = true
 	p.docMu.Unlock()
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
+		p.releaseOpenClaim(absPath)
 		return err
 	}
+	p.docMu.Lock()
 	if p.sourceCache == nil {
 		p.sourceCache = map[string][]byte{}
 	}
 	p.sourceCache[absPath] = content
+	p.docMu.Unlock()
 
 	langID := p.languageIDFor(absPath)
 
@@ -2798,13 +2811,25 @@ func (p *Provider) openDocument(repoRoot, relPath string) error {
 			Text:       string(content),
 		},
 	}); err != nil {
+		p.releaseOpenClaim(absPath)
 		return err
 	}
 	p.docMu.Lock()
-	p.openDocs[absPath] = true
 	p.docVersions[absPath] = 1
 	p.docMu.Unlock()
 	return nil
+}
+
+// releaseOpenClaim reverts openDocument's optimistic openDocs claim
+// after a failed read or didOpen: the file is not open on the server
+// and must not stay marked, or a retry would silently skip its
+// didOpen. The sourceCache entry written between claim and failure is
+// dropped too — the bytes may never have reached the server.
+func (p *Provider) releaseOpenClaim(absPath string) {
+	p.docMu.Lock()
+	delete(p.openDocs, absPath)
+	delete(p.sourceCache, absPath)
+	p.docMu.Unlock()
 }
 
 // languageIDFor picks the LSP `languageId` to send in didOpen. When
@@ -2833,11 +2858,11 @@ func (p *Provider) changeDocument(absPath, newText string) error {
 	p.docMu.Lock()
 	v := p.docVersions[absPath] + 1
 	p.docVersions[absPath] = v
-	p.docMu.Unlock()
 	if p.sourceCache == nil {
 		p.sourceCache = map[string][]byte{}
 	}
 	p.sourceCache[absPath] = []byte(newText)
+	p.docMu.Unlock()
 	return p.client.Notify("textDocument/didChange", DidChangeTextDocumentParams{
 		TextDocument: VersionedTextDocumentIdentifier{
 			URI:     pathToURI(absPath),
@@ -2856,12 +2881,12 @@ func (p *Provider) closeDocument(absPath string) error {
 	}
 	delete(p.openDocs, absPath)
 	delete(p.docVersions, absPath)
-	p.docMu.Unlock()
 	// Drop this file's cached bytes too. getSource tolerates a miss
 	// (falls back to col=0) and the next openDocument repopulates, so
 	// without this an interactive session that navigates thousands of
 	// files would pin every one's contents until the daemon exits.
 	delete(p.sourceCache, absPath)
+	p.docMu.Unlock()
 	return p.client.Notify("textDocument/didClose", DidCloseTextDocumentParams{
 		TextDocument: TextDocumentIdentifier{URI: pathToURI(absPath)},
 	})
@@ -3131,6 +3156,8 @@ func (p *Provider) EnrichNode(g graph.Store, repoRoot string, n *graph.Node) (bo
 // openDocument call. Returns nil when not cached — callers fall
 // back to col=0 then.
 func (p *Provider) getSource(repoRoot, relPath string) []byte {
+	p.docMu.RLock()
+	defer p.docMu.RUnlock()
 	if p.sourceCache == nil {
 		return nil
 	}
